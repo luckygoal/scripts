@@ -5,7 +5,7 @@
 # 1. mTLS (双向 TLS) 加密认证，无需用户名和密码
 # 2. 握手层拦截未授权请求，天然免疫 GFW 主动探测与端口扫描
 # 3. 自动生成 CA、服务端证书与客户端证书 (.p12 格式一键导入)
-# 4. 内置临时安全下载服务，浏览器一键获取证书包
+# 4. 内置临时安全下载服务 (3分钟自动销毁/按q退出)
 # 5. 支持在任意路径下直接运行，自动注册全局 gost 命令
 # =========================================================
 
@@ -290,28 +290,49 @@ start_download_server() {
 
     clear
     echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e "${GREEN}        GOST mTLS 客户端证书安全下载服务 (已开启)    ${PLAIN}"
+    echo -e "${GREEN}        GOST mTLS 客户端证书临时下载服务 (已开启)    ${PLAIN}"
     echo -e "${GREEN}====================================================${PLAIN}"
     echo -e "  ${SKYBLUE}下载服务地址 (在浏览器直接打开即可下载):${PLAIN}"
     echo -e ""
-    echo -e "  📦 ${GREEN}PKCS#12 证书 (推荐双击导入):${PLAIN}"
+    if [[ -n "${DOMAIN}" && "${DOMAIN}" != "${server_ip}" ]]; then
+        echo -e "  📦 ${GREEN}PKCS#12 证书 (域名推荐):${PLAIN}"
+        echo -e "     http://${DOMAIN}:${dl_port}/${token}/client.p12"
+        echo -e ""
+        echo -e "  📦 ${GREEN}完整证书 ZIP 压缩包 (域名):${PLAIN}"
+        echo -e "     http://${DOMAIN}:${dl_port}/${token}/client-certs.zip"
+        echo -e ""
+    fi
+    echo -e "  📦 ${GREEN}PKCS#12 证书 (IP 直连):${PLAIN}"
     echo -e "     http://${server_ip}:${dl_port}/${token}/client.p12"
     echo -e ""
-    echo -e "  📦 ${GREEN}完整证书 ZIP 压缩包:${PLAIN}"
+    echo -e "  📦 ${GREEN}完整证书 ZIP 压缩包 (IP 直连):${PLAIN}"
     echo -e "     http://${server_ip}:${dl_port}/${token}/client-certs.zip"
     echo -e ""
     echo -e "  🔑 ${SKYBLUE}证书导入密码:${PLAIN} ${P12_PASS:-123456}"
     echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e "  ${YELLOW}提示: 下载完成后，请按任意键关闭下载服务器。${PLAIN}"
-    echo -e "  (若长时间无操作，此临时服务器将在 15 分钟后自动销毁)"
+    echo -e "  ${YELLOW}提示: 服务将在 3 分钟后自动销毁关闭，也可按 [q] 键提前退出${PLAIN}"
     echo -e "${GREEN}====================================================${PLAIN}"
 
-    ( sleep 900 && kill "${server_pid}" >/dev/null 2>&1 && rm -rf "${dl_dir}" ) &
+    local remaining=180
+    while [[ $remaining -gt 0 ]]; do
+        printf "\r  ⏳ 剩余有效时间: %02d:%02d (按 [q] 提前退出)... " $((remaining / 60)) $((remaining % 60))
+        if read -r -t 1 -n 1 user_input 2>/dev/null; then
+            if [[ "$user_input" == "q" || "$user_input" == "Q" ]]; then
+                echo ""
+                break
+            fi
+        fi
+        if ! kill -0 "${server_pid}" 2>/dev/null; then
+            echo -e "\n${RED}[提示] 下载服务进程已结束${PLAIN}"
+            break
+        fi
+        remaining=$((remaining - 1))
+    done
+    echo ""
 
-    read -r -p "按回车键立即关闭下载服务器: "
     kill "${server_pid}" >/dev/null 2>&1 || true
     rm -rf "${dl_dir}"
-    echo -e "${GREEN}[已安全关闭] 临时下载端口与文件已清理！${PLAIN}"
+    echo -e "${GREEN}[已安全关闭] 临时下载端口与临时文件已清理完成！${PLAIN}"
     sleep 1
 }
 
