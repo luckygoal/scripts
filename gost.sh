@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
-# GOST v3 (go-gost/gost) 一键管理与探针防御部署脚本
-# 支持 HTTP / HTTPS(TLS) 代理、已有证书自动检测、本地伪装站挂载
+# GOST v3 (go-gost/gost) 一键管理与探针防御部署脚本 (全自动自适应版)
+# 支持 HTTP / HTTPS(TLS) 代理、证书/域名自动提取、本地伪装站挂载
 # 兼容 Debian / Ubuntu / CentOS / AlmaLinux / RockyLinux
 # =========================================================
 
@@ -130,6 +130,38 @@ detect_existing_certs() {
     done
 }
 
+detect_existing_domain() {
+    DETECTED_DOMAIN=""
+    if [[ -n "$DETECTED_CERT" && -f "$DETECTED_CERT" ]]; then
+        # 优先使用 openssl 解析证书 CN (Common Name)
+        local cn
+        cn=$(openssl x509 -noout -subject -in "$DETECTED_CERT" 2>/dev/null | sed -n 's/.*CN[ =]*//p' | awk '{print $1}' | tr -d '/' || echo "")
+        if [[ -n "$cn" && "$cn" != "localhost" ]]; then
+            DETECTED_DOMAIN="$cn"
+            return
+        fi
+        # 备选：从证书文件名提取
+        local base
+        base=$(basename "$DETECTED_CERT")
+        base="${base%.crt}"
+        base="${base%.cer}"
+        base="${base%.fullchain.pem}"
+        base="${base%.pem}"
+        if [[ -n "$base" && "$base" != "fullchain" && "$base" != "cert" ]]; then
+            DETECTED_DOMAIN="$base"
+            return
+        fi
+    fi
+    # 若无法从证书获取，尝试获取系统 hostname
+    local h
+    h=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
+    if [[ "$h" == *"."* && "$h" != "localhost.localdomain" ]]; then
+        DETECTED_DOMAIN="$h"
+    else
+        DETECTED_DOMAIN="example.com"
+    fi
+}
+
 detect_existing_site_file() {
     DETECTED_SITE_FILE=""
     if [[ -f "/usr/share/nginx/html/index.html" ]]; then
@@ -186,7 +218,6 @@ generate_gost_config() {
 
     mkdir -p "${CONFIG_DIR}"
 
-    # 处理输入为目录的情况，自动拼接 index.html
     if [[ -d "$site_file" ]]; then
         site_file="${site_file}/index.html"
     fi
@@ -369,6 +400,7 @@ interactive_install() {
     echo -e "${SKYBLUE}=========================================${PLAIN}"
 
     detect_existing_certs
+    detect_existing_domain
     detect_existing_site_file
 
     echo -e "请选择代理协议类型:"
@@ -414,7 +446,7 @@ interactive_install() {
     read -r -p "请输入代理认证密码 [默认随机: ${default_pass}]: " input_pass
     local pass="${input_pass:-$default_pass}"
 
-    local default_domain="node7.mmtqtq.com"
+    local default_domain="${DETECTED_DOMAIN:-example.com}"
     read -r -p "请输入伪装站点域名 [默认: ${default_domain}]: " input_domain
     local domain="${input_domain:-$default_domain}"
 
