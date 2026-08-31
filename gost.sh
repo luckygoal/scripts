@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # =========================================================
-# GOST v3 (go-gost/gost) 一键管理与探针防御部署脚本 (全自动自适应版)
-# 支持 HTTP / HTTPS(TLS) 代理、证书/域名自动提取、本地伪装站挂载
-# 兼容 Debian / Ubuntu / CentOS / AlmaLinux / RockyLinux
+# GOST v3 mTLS 双向认证代理一键管理脚本 (免密/防探测极速版)
+# 特性：
+# 1. mTLS (双向 TLS) 加密认证，无需用户名和密码
+# 2. 握手层拦截未授权请求，天然免疫 GFW 主动探测与端口扫描
+# 3. 自动生成 CA、服务端证书与客户端证书 (.p12 格式一键导入)
+# 4. 内置临时安全下载服务，浏览器一键获取证书包
+# 5. 支持在任意路径下直接运行，自动注册全局 gost 命令
 # =========================================================
 
 set -e
@@ -14,13 +18,15 @@ SKYBLUE="\033[0;36m"
 PLAIN="\033[0m"
 
 CONFIG_DIR="/etc/gost"
+CERTS_DIR="${CONFIG_DIR}/certs"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 ENV_FILE="${CONFIG_DIR}/config.env"
-DEFAULT_SITE_DIR="/var/www/gost_site"
 SERVICE_FILE="/etc/systemd/system/gost.service"
 BIN_PATH="/usr/local/bin/gost-bin"
-SCRIPT_PATH="/usr/local/bin/gost.sh"
-LINK_PATH="/usr/local/bin/gost"
+GLOBAL_LINK="/usr/local/bin/gost"
+
+# 获取脚本自身绝对路径，保证在任何目录下均可执行
+CURRENT_SCRIPT="$(readlink -f "$0" 2>/dev/null || echo "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")")"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -43,11 +49,11 @@ install_dependencies() {
     echo -e "${SKYBLUE}[信息]${PLAIN} 正在检查并安装必要依赖..."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
-        apt-get install -y curl wget tar lsof procps openssl ca-certificates jq
+        apt-get install -y curl wget tar lsof procps openssl ca-certificates jq zip python3
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget tar lsof procps-ng openssl ca-certificates jq
+        dnf install -y curl wget tar lsof procps-ng openssl ca-certificates jq zip python3
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget tar lsof procps-ng openssl ca-certificates jq
+        yum install -y curl wget tar lsof procps-ng openssl ca-certificates jq zip python3
     fi
 }
 
@@ -67,6 +73,9 @@ get_latest_version() {
 }
 
 install_gost_bin() {
+    if [[ -f "${BIN_PATH}" && -x "${BIN_PATH}" ]]; then
+        return 0
+    fi
     check_arch
     local tag version_num tar_file download_url
     tag=$(get_latest_version)
@@ -133,14 +142,12 @@ detect_existing_certs() {
 detect_existing_domain() {
     DETECTED_DOMAIN=""
     if [[ -n "$DETECTED_CERT" && -f "$DETECTED_CERT" ]]; then
-        # 优先使用 openssl 解析证书 CN (Common Name)
         local cn
         cn=$(openssl x509 -noout -subject -in "$DETECTED_CERT" 2>/dev/null | sed -n 's/.*CN[ =]*//p' | awk '{print $1}' | tr -d '/' || echo "")
         if [[ -n "$cn" && "$cn" != "localhost" ]]; then
             DETECTED_DOMAIN="$cn"
             return
         fi
-        # 备选：从证书文件名提取
         local base
         base=$(basename "$DETECTED_CERT")
         base="${base%.crt}"
@@ -152,132 +159,92 @@ detect_existing_domain() {
             return
         fi
     fi
-    # 若无法从证书获取，尝试获取系统 hostname
     local h
     h=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
     if [[ "$h" == *"."* && "$h" != "localhost.localdomain" ]]; then
         DETECTED_DOMAIN="$h"
     else
-        DETECTED_DOMAIN="example.com"
+        DETECTED_DOMAIN=$(get_public_ip)
     fi
 }
 
-detect_existing_site_file() {
-    DETECTED_SITE_FILE=""
-    if [[ -f "/usr/share/nginx/html/index.html" ]]; then
-        DETECTED_SITE_FILE="/usr/share/nginx/html/index.html"
-    elif [[ -f "/var/www/html/index.html" ]]; then
-        DETECTED_SITE_FILE="/var/www/html/index.html"
-    else
-        DETECTED_SITE_FILE="${DEFAULT_SITE_DIR}/index.html"
-    fi
-}
-
-create_default_camouflage_site() {
+generate_mtls_certificates() {
     local domain="$1"
-    mkdir -p "${DEFAULT_SITE_DIR}"
-    cat << EOF > "${DEFAULT_SITE_DIR}/index.html"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to ${domain:-Default Site}</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-        .card { max-width: 540px; width: 100%; background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 40px; text-align: center; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); }
-        .icon { width: 56px; height: 56px; margin: 0 auto 20px; background: rgba(34, 197, 94, 0.15); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #22c55e; font-size: 28px; }
-        h1 { font-size: 24px; font-weight: 600; margin-bottom: 12px; color: #ffffff; }
-        p { font-size: 14px; line-height: 1.6; color: #94a3b8; margin-bottom: 24px; }
-        .badge { display: inline-block; padding: 6px 14px; background: #0f172a; border: 1px solid #334155; border-radius: 9999px; font-size: 12px; color: #38bdf8; letter-spacing: 0.5px; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div class="icon">✓</div>
-        <h1>Service Active</h1>
-        <p>The web application gateway is running smoothly and all systems are fully operational.</p>
-        <span class="badge">Host: ${domain:-example.com}</span>
-    </div>
-</body>
-</html>
-EOF
+    local p12_pass="$2"
+    mkdir -p "${CERTS_DIR}"
+    cd "${CERTS_DIR}"
+
+    echo -e "${SKYBLUE}[信息]${PLAIN} 正在生成 mTLS 根证书 (CA) 与客户端证书..."
+
+    # 1. 生成独立的 CA 根证书 (10年有效期)
+    openssl genrsa -out ca.key 2048 >/dev/null 2>&1
+    openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -out ca.crt \
+        -subj "/C=CN/ST=State/L=City/O=GOST-mTLS-CA/CN=GOST-mTLS-Root-CA" >/dev/null 2>&1
+
+    # 2. 生成服务端证书 (自签备用)
+    if [[ ! -f "${CERTS_DIR}/server.crt" || ! -f "${CERTS_DIR}/server.key" ]]; then
+        openssl genrsa -out server.key 2048 >/dev/null 2>&1
+        openssl req -new -key server.key -out server.csr \
+            -subj "/C=CN/ST=State/L=City/O=GOST-Server/CN=${domain}" >/dev/null 2>&1
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 3650 -sha256 >/dev/null 2>&1
+        rm -f server.csr
+    fi
+
+    # 3. 生成客户端私钥并签发客户端证书
+    openssl genrsa -out client.key 2048 >/dev/null 2>&1
+    openssl req -new -key client.key -out client.csr \
+        -subj "/C=CN/ST=State/L=City/O=GOST-Client/CN=gost-client-cert" >/dev/null 2>&1
+    openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 3650 -sha256 >/dev/null 2>&1
+    rm -f client.csr
+
+    # 4. 打包生成 Windows / macOS / iOS / 浏览器通用的 PKCS#12 (.p12) 格式
+    openssl pkcs12 -export -out client.p12 -inkey client.key -in client.crt -certfile ca.crt -passout "pass:${p12_pass}" >/dev/null 2>&1
+
+    # 5. 生成客户端完整压缩包
+    zip -q -j client-certs.zip ca.crt client.crt client.key client.p12
+    tar -zcf client-certs.tar.gz ca.crt client.crt client.key client.p12
+
+    echo -e "${GREEN}[成功]${PLAIN} mTLS 证书生成完成！包含: ca.crt, client.crt, client.key, client.p12"
 }
 
 generate_gost_config() {
-    local proto="$1"
-    local port="$2"
-    local u="$3"
-    local p="$4"
-    local probe="$5"
-    local site_file="$6"
-    local cert_file="$7"
-    local key_file="$8"
-    local domain="$9"
+    local port="$1"
+    local server_cert="$2"
+    local server_key="$3"
+    local ca_cert="$4"
+    local domain="$5"
+    local p12_pass="$6"
 
     mkdir -p "${CONFIG_DIR}"
 
-    if [[ -d "$site_file" ]]; then
-        site_file="${site_file}/index.html"
-    fi
-
-    local probe_yaml=""
-    if [[ "$probe" == "on" && -n "$site_file" && -f "$site_file" ]]; then
-        probe_yaml="metadata:
-        probeResist: \"file:${site_file}\""
-    fi
-
-    if [[ "$proto" == "https" && -n "$cert_file" && -n "$key_file" ]]; then
-        cat << EOF > "${CONFIG_FILE}"
+    cat << EOF > "${CONFIG_FILE}"
 services:
-  - name: gost-proxy
+  - name: gost-mtls-proxy
     addr: ":${port}"
     handler:
       type: http
-      auth:
-        username: "${u}"
-        password: "${p}"
-      ${probe_yaml}
     listener:
       type: tls
       tls:
-        certFile: "${cert_file}"
-        keyFile: "${key_file}"
+        certFile: "${server_cert}"
+        keyFile: "${server_key}"
+        caFile: "${ca_cert}"
 EOF
-    else
-        cat << EOF > "${CONFIG_FILE}"
-services:
-  - name: gost-proxy
-    addr: ":${port}"
-    handler:
-      type: http
-      auth:
-        username: "${u}"
-        password: "${p}"
-      ${probe_yaml}
-    listener:
-      type: tcp
-EOF
-    fi
 
     cat << EOF > "${ENV_FILE}"
-PROTO="${proto}"
 PORT="${port}"
-USER="${u}"
-PASS="${p}"
-PROBE_RESISTANT="${probe}"
-SITE_FILE="${site_file}"
-CERT_FILE="${cert_file}"
-KEY_FILE="${key_file}"
-CAMOUFLAGE_DOMAIN="${domain}"
+SERVER_CERT="${server_cert}"
+SERVER_KEY="${server_key}"
+CA_CERT="${ca_cert}"
+DOMAIN="${domain}"
+P12_PASS="${p12_pass}"
 EOF
 }
 
 setup_systemd() {
     cat << EOF > "${SERVICE_FILE}"
 [Unit]
-Description=GOST v3 Proxy Service
+Description=GOST v3 mTLS Proxy Service
 After=network.target network-online.target nss-lookup.target
 
 [Service]
@@ -298,6 +265,56 @@ EOF
     sleep 1
 }
 
+start_download_server() {
+    if [[ ! -f "${CERTS_DIR}/client.p12" ]]; then
+        echo -e "${RED}[错误]${PLAIN} 未找到证书文件，请先安装 GOST mTLS 服务！"
+        return 1
+    fi
+
+    source "${ENV_FILE}" 2>/dev/null || true
+    local server_ip
+    server_ip=$(get_public_ip)
+    local token
+    token=$(openssl rand -hex 6)
+    local dl_port
+    dl_port=$(shuf -i 20000-35000 -n 1)
+
+    local dl_dir="/tmp/gost_download_${token}"
+    mkdir -p "${dl_dir}/${token}"
+    cp "${CERTS_DIR}/client.p12" "${dl_dir}/${token}/client.p12"
+    cp "${CERTS_DIR}/client-certs.zip" "${dl_dir}/${token}/client-certs.zip"
+    cp "${CERTS_DIR}/ca.crt" "${dl_dir}/${token}/ca.crt"
+
+    python3 -m http.server "${dl_port}" --directory "${dl_dir}" >/dev/null 2>&1 &
+    local server_pid=$!
+
+    clear
+    echo -e "${GREEN}====================================================${PLAIN}"
+    echo -e "${GREEN}        GOST mTLS 客户端证书安全下载服务 (已开启)    ${PLAIN}"
+    echo -e "${GREEN}====================================================${PLAIN}"
+    echo -e "  ${SKYBLUE}下载服务地址 (在浏览器直接打开即可下载):${PLAIN}"
+    echo -e ""
+    echo -e "  📦 ${GREEN}PKCS#12 证书 (推荐双击导入):${PLAIN}"
+    echo -e "     http://${server_ip}:${dl_port}/${token}/client.p12"
+    echo -e ""
+    echo -e "  📦 ${GREEN}完整证书 ZIP 压缩包:${PLAIN}"
+    echo -e "     http://${server_ip}:${dl_port}/${token}/client-certs.zip"
+    echo -e ""
+    echo -e "  🔑 ${SKYBLUE}证书导入密码:${PLAIN} ${P12_PASS:-123456}"
+    echo -e "${GREEN}====================================================${PLAIN}"
+    echo -e "  ${YELLOW}提示: 下载完成后，请按任意键关闭下载服务器。${PLAIN}"
+    echo -e "  (若长时间无操作，此临时服务器将在 15 分钟后自动销毁)"
+    echo -e "${GREEN}====================================================${PLAIN}"
+
+    ( sleep 900 && kill "${server_pid}" >/dev/null 2>&1 && rm -rf "${dl_dir}" ) &
+
+    read -r -p "按回车键立即关闭下载服务器: "
+    kill "${server_pid}" >/dev/null 2>&1 || true
+    rm -rf "${dl_dir}"
+    echo -e "${GREEN}[已安全关闭] 临时下载端口与文件已清理！${PLAIN}"
+    sleep 1
+}
+
 show_proxy_info() {
     if [[ ! -f "${ENV_FILE}" ]]; then
         echo -e "${RED}[错误]${PLAIN} 未检测到已保存的配置信息！"
@@ -307,37 +324,32 @@ show_proxy_info() {
     source "${ENV_FILE}"
     local server_ip
     server_ip=$(get_public_ip)
-    local host_str="${CAMOUFLAGE_DOMAIN:-$server_ip}"
+    local host_str="${DOMAIN:-$server_ip}"
 
     echo -e ""
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "${GREEN}          GOST v3 代理连接信息           ${PLAIN}"
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "  ${SKYBLUE}服务器 IP  :${PLAIN} ${server_ip}"
-    echo -e "  ${SKYBLUE}代理端口   :${PLAIN} ${PORT}"
-    echo -e "  ${SKYBLUE}传输协议   :${PLAIN} $([[ "$PROTO" == "https" ]] && echo -e "${GREEN}HTTPS (TLS 加密)${PLAIN}" || echo -e "HTTP (标准明文)")"
-    echo -e "  ${SKYBLUE}认证用户   :${PLAIN} ${USER}"
-    echo -e "  ${SKYBLUE}认证密码   :${PLAIN} ${PASS}"
-    echo -e "  ${SKYBLUE}探针防御   :${PLAIN} $([[ "$PROBE_RESISTANT" == "on" ]] && echo -e "${GREEN}已开启 (未认证直接展示伪装网站)${PLAIN}" || echo -e "${YELLOW}已关闭 (未认证返回 HTTP 407)${PLAIN}")"
-    echo -e "  ${SKYBLUE}伪装网页   :${PLAIN} ${SITE_FILE}"
-    if [[ "$PROTO" == "https" ]]; then
-        echo -e "  ${SKYBLUE}SSL 证书   :${PLAIN} ${CERT_FILE}"
-    fi
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "  ${SKYBLUE}标准代理 URL 格式:${PLAIN}"
-    if [[ "$PROTO" == "https" ]]; then
-        echo -e "  https://${USER}:${PASS}@${host_str}:${PORT}"
-    else
-        echo -e "  http://${USER}:${PASS}@${server_ip}:${PORT}"
-    fi
-    echo -e "${GREEN}=========================================${PLAIN}"
-    echo -e "  ${SKYBLUE}终端连通性测试命令:${PLAIN}"
-    if [[ "$PROTO" == "https" ]]; then
-        echo -e "  curl -x https://${USER}:${PASS}@${host_str}:${PORT} https://api.ipify.org"
-    else
-        echo -e "  curl -x http://${USER}:${PASS}@${server_ip}:${PORT} https://api.ipify.org"
-    fi
-    echo -e "${GREEN}=========================================${PLAIN}"
+    echo -e "${GREEN}======================================================${PLAIN}"
+    echo -e "${GREEN}            GOST v3 mTLS 代理连接信息                 ${PLAIN}"
+    echo -e "${GREEN}======================================================${PLAIN}"
+    echo -e "  ${SKYBLUE}服务器地址 :${PLAIN} ${host_str} (${server_ip})"
+    echo -e "  ${SKYBLUE}监听端口   :${PLAIN} ${PORT}"
+    echo -e "  ${SKYBLUE}认证模式   :${PLAIN} ${GREEN}mTLS (双向 TLS 认证，免密码)${PLAIN}"
+    echo -e "  ${SKYBLUE}防探测机制 :${PLAIN} ${GREEN}TLS 握手层拒绝无证书请求 (天然免疫探测)${PLAIN}"
+    echo -e "  ${SKYBLUE}服务端证书 :${PLAIN} ${SERVER_CERT}"
+    echo -e "  ${SKYBLUE}客户端证书 :${PLAIN} ${CERTS_DIR}/client.p12"
+    echo -e "  ${SKYBLUE}证书导入密码:${PLAIN} ${P12_PASS:-123456}"
+    echo -e "${GREEN}======================================================${PLAIN}"
+    echo -e "  ${SKYBLUE}ZeroOmega / 浏览器配置方法:${PLAIN}"
+    echo -e "  1. 双击下载的 ${GREEN}client.p12${PLAIN} 导入系统证书库 (个人证书)"
+    echo -e "  2. 在 ZeroOmega 中添加代理:"
+    echo -e "     - 协议: ${GREEN}HTTPS${PLAIN}"
+    echo -e "     - 服务器: ${GREEN}${host_str}${PLAIN}"
+    echo -e "     - 端口: ${GREEN}${PORT}${PLAIN}"
+    echo -e "     - 用户名和密码: ${YELLOW}留空！无需填写！${PLAIN}"
+    echo -e "${GREEN}======================================================${PLAIN}"
+    echo -e "  ${SKYBLUE}命令行连通性测试 (需指定客户端证书):${PLAIN}"
+    echo -e "  curl --proxy-cert ${CERTS_DIR}/client.crt --proxy-key ${CERTS_DIR}/client.key \\"
+    echo -e "       -x https://${host_str}:${PORT} https://api.ipify.org"
+    echo -e "${GREEN}======================================================${PLAIN}"
     echo -e ""
 }
 
@@ -348,166 +360,106 @@ test_proxy() {
     fi
 
     source "${ENV_FILE}"
-    echo -e "${SKYBLUE}[测试]${PLAIN} 正在通过本地代理测试外网访问..."
-
-    local proxy_url=""
-    if [[ "$PROTO" == "https" ]]; then
-        local host_str="${CAMOUFLAGE_DOMAIN:-127.0.0.1}"
-        proxy_url="https://${USER}:${PASS}@${host_str}:${PORT}"
-    else
-        proxy_url="http://${USER}:${PASS}@127.0.0.1:${PORT}"
-    fi
+    echo -e "${SKYBLUE}[测试 1] 正在测试合法客户端证书 (mTLS) 连接...${PLAIN}"
 
     local res
-    res=$(curl -s4m 6 -x "${proxy_url}" https://api.ipify.org 2>/dev/null || echo "")
-    if [[ -z "$res" && "$PROTO" == "https" ]]; then
-        res=$(curl -k -s4m 6 -x "https://${USER}:${PASS}@127.0.0.1:${PORT}" https://api.ipify.org 2>/dev/null || echo "")
-    fi
+    res=$(curl -s4m 6 --resolve "${DOMAIN:-node7.mmtqtq.com}:${PORT}:127.0.0.1" \
+        --proxy-cert "${CERTS_DIR}/client.crt" \
+        --proxy-key "${CERTS_DIR}/client.key" \
+        -x "https://${DOMAIN:-127.0.0.1}:${PORT}" https://api.ipify.org 2>/dev/null || echo "")
 
     if [[ -n "$res" ]]; then
-        echo -e "${GREEN}[成功]${PLAIN} 代理测试成功！获取到的公网出口 IP 为: ${GREEN}${res}${PLAIN}"
+        echo -e "${GREEN}[成功] mTLS 代理握手成功！出口 IP: ${res}${PLAIN}"
     else
-        echo -e "${RED}[失败]${PLAIN} 代理连接测试失败，请检查端口或日志！"
-    fi
-}
-
-toggle_probe() {
-    local target_state="$1"
-    if [[ ! -f "${ENV_FILE}" ]]; then
-        echo -e "${RED}[错误]${PLAIN} 请先安装 GOST 再调整探针防御！"
-        return 1
+        echo -e "${RED}[失败] mTLS 代理连接失败，请检查服务状态！${PLAIN}"
     fi
 
-    source "${ENV_FILE}"
-
-    if [[ "$target_state" == "on" ]]; then
-        generate_gost_config "${PROTO}" "${PORT}" "${USER}" "${PASS}" "on" "${SITE_FILE}" "${CERT_FILE}" "${KEY_FILE}" "${CAMOUFLAGE_DOMAIN}"
-        systemctl restart gost.service
-        sleep 1
-        echo -e "${GREEN}[成功]${PLAIN} Probe Resistant 已开启！未认证探测将直接展示伪装网站。"
-    elif [[ "$target_state" == "off" ]]; then
-        generate_gost_config "${PROTO}" "${PORT}" "${USER}" "${PASS}" "off" "${SITE_FILE}" "${CERT_FILE}" "${KEY_FILE}" "${CAMOUFLAGE_DOMAIN}"
-        systemctl restart gost.service
-        sleep 1
-        echo -e "${YELLOW}[成功]${PLAIN} Probe Resistant 已关闭！未认证探测将返回标准 HTTP 407 Proxy Authentication Required。"
+    echo -e "${SKYBLUE}[测试 2] 正在测试外部无证书非法探测防御 (预期: 握手直接被拒)...${PLAIN}"
+    local probe_test
+    probe_test=$(curl -s4m 4 --resolve "${DOMAIN:-node7.mmtqtq.com}:${PORT}:127.0.0.1" \
+        -x "https://${DOMAIN:-127.0.0.1}:${PORT}" https://api.ipify.org 2>&1 || true)
+    if [[ "$probe_test" == *"certificate required"* || "$probe_test" == *"handshake failure"* || "$probe_test" == *"alert"* || -z "$probe_test" ]]; then
+        echo -e "${GREEN}[成功] 防探测测试通过！未携带证书的外部连接被 TLS 握手层静默丢弃/拒绝。${PLAIN}"
+    else
+        echo -e "${YELLOW}[提示] 返回状态: ${probe_test}${PLAIN}"
     fi
 }
 
 interactive_install() {
     echo -e ""
-    echo -e "${SKYBLUE}=========================================${PLAIN}"
-    echo -e "${SKYBLUE}     GOST v3 代理配置向导 (智能检测版)    ${PLAIN}"
-    echo -e "${SKYBLUE}=========================================${PLAIN}"
+    echo -e "${SKYBLUE}====================================================${PLAIN}"
+    echo -e "${SKYBLUE}      GOST v3 mTLS 双向认证代理一键部署向导         ${PLAIN}"
+    echo -e "${SKYBLUE}====================================================${PLAIN}"
 
     detect_existing_certs
     detect_existing_domain
-    detect_existing_site_file
 
-    echo -e "请选择代理协议类型:"
-    echo -e "  1) HTTP 代理 (明文传输，客户端配置最简单)"
-    echo -e "  2) HTTPS 代理 (TLS 加密传输，配合证书伪装性极高)"
-    read -r -p "请选择 [默认: 1]: " proto_choice
-    local proto="http"
-    if [[ "$proto_choice" == "2" ]]; then
-        proto="https"
-    fi
-
-    local cert_file=""
-    local key_file=""
-    if [[ "$proto" == "https" ]]; then
-        if [[ -n "$DETECTED_CERT" ]]; then
-            echo -e "${GREEN}[检测到系统已有 SSL 证书]${PLAIN} 证书: ${DETECTED_CERT}"
-        fi
-        read -r -p "请输入 SSL 证书 CRT/PEM 完整路径 [默认: ${DETECTED_CERT}]: " input_cert
-        cert_file="${input_cert:-$DETECTED_CERT}"
-
-        read -r -p "请输入 SSL 证书 KEY 完整私钥路径 [默认: ${DETECTED_KEY}]: " input_key
-        key_file="${input_key:-$DETECTED_KEY}"
-
-        if [[ ! -f "$cert_file" || ! -f "$key_file" ]]; then
-            echo -e "${RED}[错误]${PLAIN} 证书或私钥文件不存在，请检查路径！"
-            return 1
+    local server_cert=""
+    local server_key=""
+    if [[ -n "$DETECTED_CERT" && -n "$DETECTED_KEY" ]]; then
+        echo -e "${GREEN}[检测到系统已有 SSL 证书]${PLAIN} 证书: ${DETECTED_CERT}"
+        read -r -p "是否直接使用现有权威证书作为服务端证书？[Y/n]: " use_exist
+        if [[ "$use_exist" != "n" && "$use_exist" != "N" ]]; then
+            server_cert="$DETECTED_CERT"
+            server_key="$DETECTED_KEY"
         fi
     fi
 
-    local default_port="8080"
-    if [[ "$proto" == "https" ]]; then
-        default_port="8443"
-    fi
+    local default_domain="${DETECTED_DOMAIN:-$(get_public_ip)}"
+    read -r -p "请输入服务端连接域名或 IP [默认: ${default_domain}]: " input_domain
+    local domain="${input_domain:-$default_domain}"
+
+    local default_port="8443"
     read -r -p "请输入 GOST 代理监听端口 [默认: ${default_port}]: " input_port
     local port="${input_port:-$default_port}"
 
-    local default_user="admin"
-    read -r -p "请输入代理认证用户名 [默认: ${default_user}]: " input_user
-    local user="${input_user:-$default_user}"
-
-    local default_pass
-    default_pass=$(openssl rand -base64 12 | tr -dc "a-zA-Z0-9" | head -c 12)
-    read -r -p "请输入代理认证密码 [默认随机: ${default_pass}]: " input_pass
-    local pass="${input_pass:-$default_pass}"
-
-    local default_domain="${DETECTED_DOMAIN:-example.com}"
-    read -r -p "请输入伪装站点域名 [默认: ${default_domain}]: " input_domain
-    local domain="${input_domain:-$default_domain}"
+    local default_pass="123456"
+    read -r -p "请设置客户端证书 (.p12) 导入密码 [默认: ${default_pass}]: " input_pass
+    local p12_pass="${input_pass:-$default_pass}"
 
     echo -e ""
-    if [[ -n "$DETECTED_SITE_FILE" ]]; then
-        echo -e "${GREEN}[检测到系统已有伪装网站]${PLAIN}: ${DETECTED_SITE_FILE}"
-    fi
-    read -r -p "请输入伪装站点 HTML 文件路径 [默认: ${DETECTED_SITE_FILE}]: " input_site
-    local site_file="${input_site:-$DETECTED_SITE_FILE}"
-
-    if [[ -d "$site_file" ]]; then
-        site_file="${site_file}/index.html"
-    fi
-
-    if [[ ! -f "$site_file" ]]; then
-        echo -e "${YELLOW}[提示]${PLAIN} 文件不存在，脚本将为您自动创建默认伪装网页..."
-        create_default_camouflage_site "${domain}"
-        site_file="${DEFAULT_SITE_DIR}/index.html"
-    fi
-
-    echo -e ""
-    echo -e "请选择探针防御模式 (Probe Resistant):"
-    echo -e "  1) 开启探针防御: 未认证访问时直接展示伪装网站 (${site_file}) [推荐]"
-    echo -e "  2) 关闭探针防御: 未认证访问时返回 HTTP 407 Proxy Authentication Required"
-    read -r -p "请选择 [默认: 1]: " probe_choice
-    local probe="on"
-    if [[ "$probe_choice" == "2" ]]; then
-        probe="off"
-    fi
-
-    echo -e ""
-    echo -e "${SKYBLUE}[1/4] 检查系统依赖...${PLAIN}"
+    echo -e "${SKYBLUE}[1/5] 安装系统依赖组件...${PLAIN}"
     install_dependencies
 
-    echo -e "${SKYBLUE}[2/4] 安装 GOST v3 核心组件...${PLAIN}"
+    echo -e "${SKYBLUE}[2/5] 部署 GOST v3 核心...${PLAIN}"
     install_gost_bin
 
-    echo -e "${SKYBLUE}[3/4] 写入配置文件...${PLAIN}"
-    generate_gost_config "${proto}" "${port}" "${user}" "${pass}" "${probe}" "${site_file}" "${cert_file}" "${key_file}" "${domain}"
+    echo -e "${SKYBLUE}[3/5] 生成 mTLS 根证书 (CA) 与客户端双向证书...${PLAIN}"
+    generate_mtls_certificates "${domain}" "${p12_pass}"
 
-    echo -e "${SKYBLUE}[4/4] 配置并启动 Systemd 服务...${PLAIN}"
-    setup_systemd
-
-    if [[ -f "${SCRIPT_PATH}" ]]; then
-        chmod +x "${SCRIPT_PATH}"
-        ln -sf "${SCRIPT_PATH}" "${LINK_PATH}"
+    if [[ -z "$server_cert" || -z "$server_key" ]]; then
+        server_cert="${CERTS_DIR}/server.crt"
+        server_key="${CERTS_DIR}/server.key"
     fi
 
-    echo -e "${GREEN}[完成] GOST v3 部署成功并已开启自启！${PLAIN}"
+    echo -e "${SKYBLUE}[4/5] 生成 GOST mTLS 配置文件...${PLAIN}"
+    generate_gost_config "${port}" "${server_cert}" "${server_key}" "${CERTS_DIR}/ca.crt" "${domain}" "${p12_pass}"
+
+    echo -e "${SKYBLUE}[5/5] 启动 Systemd 服务并配置自启...${PLAIN}"
+    setup_systemd
+
+    ln -sf "${CURRENT_SCRIPT}" "${GLOBAL_LINK}"
+
+    echo -e "${GREEN}[完成] GOST mTLS 服务部署成功！${PLAIN}"
     show_proxy_info
     test_proxy
+
+    echo -e ""
+    read -r -p "是否立即开启临时下载链接以下载客户端证书？[Y/n]: " open_dl
+    if [[ "$open_dl" != "n" && "$open_dl" != "N" ]]; then
+        start_download_server
+    fi
 }
 
 uninstall_gost() {
-    echo -e "${YELLOW}[警告]${PLAIN} 正在彻底卸载 GOST 服务及所有配置..."
+    echo -e "${YELLOW}[警告]${PLAIN} 正在彻底卸载 GOST 服务及所有证书与配置..."
     systemctl stop gost.service >/dev/null 2>&1 || true
     systemctl disable gost.service >/dev/null 2>&1 || true
     rm -f "${SERVICE_FILE}"
     systemctl daemon-reload
     rm -f "${BIN_PATH}"
     rm -rf "${CONFIG_DIR}"
+    rm -f "${GLOBAL_LINK}"
     echo -e "${GREEN}[成功]${PLAIN} GOST 已彻底卸载清理完成！"
 }
 
@@ -522,34 +474,40 @@ get_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${GREEN}=========================================${PLAIN}"
-        echo -e "${GREEN}     GOST v3 (go-gost/gost) 一键管理     ${PLAIN}"
-        echo -e "${GREEN}=========================================${PLAIN}"
-        echo -e " ${GREEN}1)${PLAIN} 安装 / 重新配置 GOST"
-        echo -e " ${GREEN}2)${PLAIN} 启动 GOST 服务"
-        echo -e " ${GREEN}3)${PLAIN} 停止 GOST 服务"
-        echo -e " ${GREEN}4)${PLAIN} 重启 GOST 服务"
-        echo -e " ${GREEN}5)${PLAIN} 查看 GOST 运行状态与连接信息"
-        echo -e " ${GREEN}6)${PLAIN} 查看 GOST 运行日志"
-        echo -e " ${GREEN}7)${PLAIN} 开启 Probe Resistant (防探测/展示伪装网站)"
-        echo -e " ${GREEN}8)${PLAIN} 关闭 Probe Resistant (未认证返回 HTTP 407)"
-        echo -e " ${GREEN}9)${PLAIN} 测试代理连通性"
+        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e "${GREEN}     GOST v3 mTLS 双向认证代理一键管理 (免密版)     ${PLAIN}"
+        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e " ${GREEN}1)${PLAIN} 安装 / 重新配置 GOST (mTLS)"
+        echo -e " ${GREEN}2)${PLAIN} 开启客户端证书下载链接 (在浏览器直接下载 .p12)"
+        echo -e " ${GREEN}3)${PLAIN} 重新生成客户端证书"
+        echo -e " ${GREEN}4)${PLAIN} 启动 GOST 服务"
+        echo -e " ${GREEN}5)${PLAIN} 停止 GOST 服务"
+        echo -e " ${GREEN}6)${PLAIN} 重启 GOST 服务"
+        echo -e " ${GREEN}7)${PLAIN} 查看连接配置与使用说明"
+        echo -e " ${GREEN}8)${PLAIN} 查看 GOST 实时日志"
+        echo -e " ${GREEN}9)${PLAIN} 测试 mTLS 代理连通性与防探测"
         echo -e " ${GREEN}10)${PLAIN} 彻底卸载 GOST"
         echo -e " ${GREEN}0)${PLAIN} 退出脚本"
-        echo -e "${GREEN}=========================================${PLAIN}"
+        echo -e "${GREEN}====================================================${PLAIN}"
         echo -e " 当前运行状态: $(get_status)"
-        echo -e "${GREEN}=========================================${PLAIN}"
+        echo -e "${GREEN}====================================================${PLAIN}"
         read -r -p "请输入选项 [0-10]: " choice
 
         case "$choice" in
             1) interactive_install; break ;;
-            2) systemctl start gost.service; echo -e "${GREEN}服务已启动！${PLAIN}"; sleep 1 ;;
-            3) systemctl stop gost.service; echo -e "${YELLOW}服务已停止！${PLAIN}"; sleep 1 ;;
-            4) systemctl restart gost.service; echo -e "${GREEN}服务已重启！${PLAIN}"; sleep 1 ;;
-            5) show_proxy_info; read -r -p "按回车键继续..." ;;
-            6) journalctl -u gost.service -n 50 --no-pager; read -r -p "按回车键继续..." ;;
-            7) toggle_probe "on"; read -r -p "按回车键继续..." ;;
-            8) toggle_probe "off"; read -r -p "按回车键继续..." ;;
+            2) start_download_server; break ;;
+            3)
+                source "${ENV_FILE}" 2>/dev/null || true
+                generate_mtls_certificates "${DOMAIN:-example.com}" "${P12_PASS:-123456}"
+                systemctl restart gost.service
+                echo -e "${GREEN}客户端证书已重新生成并应用！${PLAIN}"
+                read -r -p "按回车键继续..."
+                ;;
+            4) systemctl start gost.service; echo -e "${GREEN}服务已启动！${PLAIN}"; sleep 1 ;;
+            5) systemctl stop gost.service; echo -e "${YELLOW}服务已停止！${PLAIN}"; sleep 1 ;;
+            6) systemctl restart gost.service; echo -e "${GREEN}服务已重启！${PLAIN}"; sleep 1 ;;
+            7) show_proxy_info; read -r -p "按回车键继续..." ;;
+            8) journalctl -u gost.service -n 50 --no-pager; read -r -p "按回车键继续..." ;;
             9) test_proxy; read -r -p "按回车键继续..." ;;
             10) uninstall_gost; break ;;
             0) exit 0 ;;
@@ -559,6 +517,11 @@ main_menu() {
 }
 
 check_root
+
+# 自动保持全局软链接可用
+if [[ "$0" != "${GLOBAL_LINK}" && -f "$0" ]]; then
+    ln -sf "${CURRENT_SCRIPT}" "${GLOBAL_LINK}" 2>/dev/null || true
+fi
 
 case "$1" in
     start)
@@ -579,15 +542,11 @@ case "$1" in
     test)
         test_proxy
         ;;
+    download|dl)
+        start_download_server
+        ;;
     log)
         journalctl -u gost.service -n 50 --no-pager
-        ;;
-    probe)
-        if [[ "$2" == "on" || "$2" == "off" ]]; then
-            toggle_probe "$2"
-        else
-            echo "用法: gost probe on|off"
-        fi
         ;;
     uninstall)
         uninstall_gost
