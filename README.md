@@ -2,4 +2,9 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/luckygoal/scrip
 
 
 
-wget -N --no-check-certificate https://raw.githubusercontent.com/luckygoal/scripts/main/clone.sh && chmod +x clone.sh && ./clone.sh
+
+
+wget -N --no-check-certificate https://raw.githubusercontent.com/luckygoal/scripts/main/clone.sh
+chmod +x clone.sh
+./clone.sh
+
