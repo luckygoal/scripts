@@ -1,28 +1,34 @@
 #!/bin/bash
 
-# 自动读取 Token
-TOKEN=$(cat ~/.github_token)
-if [ -z "$TOKEN" ]; then
-    echo "错误：未找到 Token，请运行：echo \"你的token\" > ~/.github_token"
+# 如果不是手动执行（stdin 不是 tty），自动退出
+if ! [ -t 0 ]; then
+    echo "请手动执行： clone.sh"
+    exit 0
+fi
+
+echo "请输入要备份的 GitHub 仓库链接（例如：https://github.com/xxx/yyy.git）:"
+read SRC_URL
+
+if [ -z "$SRC_URL" ]; then
+    echo "错误：仓库链接不能为空"
     exit 1
 fi
 
-# 必须提供仓库链接
-if [ -z "$1" ]; then
-    echo "用法：clone.sh https://github.com/xxx/yyy.git"
-    exit 1
-fi
-
-SRC_URL="$1"
-
-# 自动识别仓库名
 REPO=$(basename "$SRC_URL" .git)
 
 echo "源仓库：$SRC_URL"
 echo "仓库名：$REPO"
 
+# 手动输入 Token
+read -p "请输入你的 GitHub Token: " TOKEN
+
 # 自动识别你的 GitHub 用户名
 USERNAME=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/user | grep '"login"' | awk -F '"' '{print $4}')
+
+if [ -z "$USERNAME" ]; then
+    echo "Token 无效，请检查后重试。"
+    exit 1
+fi
 
 echo "你的 GitHub 用户名：$USERNAME"
 
