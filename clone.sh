@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 用法:
-# ./gh-backup.sh https://github.com/xxx/yyy.git
+# ./clone.sh https://github.com/xxx/yyy.git
 
 if [ -z "$1" ]; then
     echo "请提供 GitHub 仓库链接"
