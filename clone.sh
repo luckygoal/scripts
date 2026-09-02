@@ -5,9 +5,9 @@ read_tty() {
     read "$@" < /dev/tty
 }
 
-# 修复 Token 输入问题：使用 read -rsp 强制等待输入
-printf "请输入你的 GitHub Token（输入时不会显示）: "
-read -rsp "" TOKEN
+# 明文输入 Token（WebSSH 必须用这种方式）
+echo "请输入你的 GitHub Token（注意：此环境无法隐藏输入）:"
+read_tty TOKEN
 echo ""
 
 # 自动识别 GitHub 用户名
