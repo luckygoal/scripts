@@ -1,78 +1,55 @@
 #!/bin/bash
 
-# 强制从真实终端读取输入，避免 WebSSH 自动回车问题
-read_tty() {
-    read "$@" < /dev/tty
-}
+# 自动读取 Token
+TOKEN=$(cat ~/.github_token)
+if [ -z "$TOKEN" ]; then
+    echo "错误：未找到 Token，请运行：echo \"你的token\" > ~/.github_token"
+    exit 1
+fi
 
-# 明文输入 Token（WebSSH 必须用这种方式）
-echo "请输入你的 GitHub Token（注意：此环境无法隐藏输入）:"
-read_tty TOKEN
-echo ""
+# 必须提供仓库链接
+if [ -z "$1" ]; then
+    echo "用法：clone.sh https://github.com/xxx/yyy.git"
+    exit 1
+fi
 
-# 自动识别 GitHub 用户名
-echo "正在自动识别你的 GitHub 用户名..."
+SRC_URL="$1"
+
+# 自动识别仓库名
+REPO=$(basename "$SRC_URL" .git)
+
+echo "源仓库：$SRC_URL"
+echo "仓库名：$REPO"
+
+# 自动识别你的 GitHub 用户名
 USERNAME=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/user | grep '"login"' | awk -F '"' '{print $4}')
 
-if [ -z "$USERNAME" ]; then
-    echo "无法识别 GitHub 用户名，请检查 Token 是否正确。"
-    exit 1
-fi
+echo "你的 GitHub 用户名：$USERNAME"
 
-echo "检测到你的 GitHub 用户名：$USERNAME"
-echo ""
+# 创建 Private 仓库
+echo "创建 Private 仓库：$REPO"
+curl -s -H "Authorization: token $TOKEN" \
+     -H "Accept: application/vnd.github+json" \
+     https://api.github.com/user/repos \
+     -d "{\"name\":\"$REPO\", \"private\":true}"
 
-echo "正在读取你的 GitHub Public 仓库列表..."
+# clone 原仓库
+echo "正在 clone 原仓库..."
+git clone --mirror "$SRC_URL" "/tmp/$REPO.git"
 
-REPOS=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/users/$USERNAME/repos?per_page=200" | \
-        grep '"name"' | awk -F '"' '{print $4}')
+cd "/tmp/$REPO.git"
 
-if [ -z "$REPOS" ]; then
-    echo "未找到任何 Public 仓库，或 Token 权限不足。"
-    exit 1
-fi
-
-echo "找到以下 Public 仓库："
-echo "$REPOS"
-echo ""
-echo "开始自动备份..."
-
-for REPO in $REPOS; do
-    echo "----------------------------------------"
-    echo "处理仓库：$REPO"
-
-    # 检查 private 仓库是否已存在
-    CHECK=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/repos/$USERNAME/$REPO")
-
-    if echo "$CHECK" | grep -q '"full_name"'; then
-        echo "仓库 $REPO 已存在，跳过创建步骤。"
-    else
-        echo "创建 private 仓库：$REPO"
-        curl -s -H "Authorization: token $TOKEN" \
-             -H "Accept: application/vnd.github+json" \
-             https://api.github.com/user/repos \
-             -d "{\"name\":\"$REPO\", \"private\":true}"
-    fi
-
-    echo "正在 clone 原仓库：$REPO"
-    git clone --mirror "https://github.com/$USERNAME/$REPO.git" "/tmp/$REPO.git"
-
-    cd "/tmp/$REPO.git"
-
-    echo "清理 GitHub 不允许推送的 hidden refs..."
-    git for-each-ref --format="%(refname)" refs/pull | while read ref; do
-        git update-ref -d "$ref"
-    done
-
-    echo "推送到 private 仓库：$REPO"
-    git remote set-url origin "https://$USERNAME:$TOKEN@github.com/$USERNAME/$REPO.git"
-    git push --mirror origin
-
-    cd /
-    rm -rf "/tmp/$REPO.git"
-
-    echo "完成备份：$REPO"
+# 清理 GitHub 不允许推送的 hidden refs
+git for-each-ref --format="%(refname)" refs/pull | while read ref; do
+    git update-ref -d "$ref"
 done
 
-echo "----------------------------------------"
-echo "全部 Public 仓库已备份完成！"
+# 推送到你的 Private 仓库
+echo "推送到 Private 仓库：$REPO"
+git remote set-url origin "https://$USERNAME:$TOKEN@github.com/$USERNAME/$REPO.git"
+git push --mirror origin
+
+cd /
+rm -rf "/tmp/$REPO.git"
+
+echo "备份完成：$REPO"
