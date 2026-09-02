@@ -4,7 +4,10 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/luckygoal/scrip
 
 
 
+
+
 wget -N --no-check-certificate https://raw.githubusercontent.com/luckygoal/scripts/main/clone.sh
 chmod +x clone.sh
-./clone.sh
+sudo mv clone.sh /usr/local/bin/clone.sh
+echo "脚本已安装，请执行： clone.sh"
 
