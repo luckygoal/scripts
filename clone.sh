@@ -5,8 +5,9 @@ read_tty() {
     read "$@" < /dev/tty
 }
 
-echo "请输入你的 GitHub Token（输入时不会显示）:"
-read_tty -s TOKEN
+# 修复 Token 输入问题：使用 read -rsp 强制等待输入
+printf "请输入你的 GitHub Token（输入时不会显示）: "
+read -rsp "" TOKEN
 echo ""
 
 # 自动识别 GitHub 用户名
@@ -53,7 +54,6 @@ for REPO in $REPOS; do
              -d "{\"name\":\"$REPO\", \"private\":true}"
     fi
 
-    # clone 原仓库
     echo "正在 clone 原仓库：$REPO"
     git clone --mirror "https://github.com/$USERNAME/$REPO.git" "/tmp/$REPO.git"
 
