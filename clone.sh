@@ -5,16 +5,25 @@ read_tty() {
     read "$@" < /dev/tty
 }
 
-echo "请输入你的 GitHub 用户名（例如：lu******l）:"
-read_tty USERNAME
-
-echo "请输入你的 GitHub 密码或 Token（输入时不会显示）:"
+echo "请输入你的 GitHub Token（输入时不会显示）:"
 read_tty -s TOKEN
+echo ""
+
+# 自动识别 GitHub 用户名
+echo "正在自动识别你的 GitHub 用户名..."
+USERNAME=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/user | grep '"login"' | awk -F '"' '{print $4}')
+
+if [ -z "$USERNAME" ]; then
+    echo "无法识别 GitHub 用户名，请检查 Token 是否正确。"
+    exit 1
+fi
+
+echo "检测到你的 GitHub 用户名：$USERNAME"
 echo ""
 
 echo "正在读取你的 GitHub Public 仓库列表..."
 
-REPOS=$(curl -s -u "$USERNAME:$TOKEN" "https://api.github.com/users/$USERNAME/repos?per_page=200" | \
+REPOS=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/users/$USERNAME/repos?per_page=200" | \
         grep '"name"' | awk -F '"' '{print $4}')
 
 if [ -z "$REPOS" ]; then
@@ -32,13 +41,13 @@ for REPO in $REPOS; do
     echo "处理仓库：$REPO"
 
     # 检查 private 仓库是否已存在
-    CHECK=$(curl -s -u "$USERNAME:$TOKEN" "https://api.github.com/repos/$USERNAME/$REPO")
+    CHECK=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/repos/$USERNAME/$REPO")
 
     if echo "$CHECK" | grep -q '"full_name"'; then
         echo "仓库 $REPO 已存在，跳过创建步骤。"
     else
         echo "创建 private 仓库：$REPO"
-        curl -s -u "$USERNAME:$TOKEN" \
+        curl -s -H "Authorization: token $TOKEN" \
              -H "Accept: application/vnd.github+json" \
              https://api.github.com/user/repos \
              -d "{\"name\":\"$REPO\", \"private\":true}"
