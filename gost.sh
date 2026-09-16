@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
+
 # =========================================================
 # GOST v3 mTLS 双向认证代理一键管理脚本 (免密/防探测极速版)
 # 特性：
 # 1. mTLS (双向 TLS) 加密认证，无需用户名和密码
 # 2. 握手层拦截未授权请求，天然免疫 GFW 主动探测与端口扫描
 # 3. 自动生成 CA、服务端证书与客户端证书 (.p12 格式一键导入)
-# 4. 内置临时安全下载服务 (3分钟自动销毁/按q退出)
-# 5. 支持在任意路径下直接运行，自动注册全局 gost 命令
+# 4. 自动检测并分配可用高位端口 (10000-60000)，避开常用服务
+# 5. 内置临时安全下载服务 (3分钟自动销毁/按q退出)
+# 6. 支持在任意路径下直接运行，自动注册全局 gost 命令
 # =========================================================
 
 set -e
@@ -49,12 +51,54 @@ install_dependencies() {
     echo -e "${SKYBLUE}[信息]${PLAIN} 正在检查并安装必要依赖..."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
-        apt-get install -y curl wget tar lsof procps openssl ca-certificates jq zip python3
+        apt-get install -y curl wget tar lsof procps openssl ca-certificates jq zip python3 iproute2
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget tar lsof procps-ng openssl ca-certificates jq zip python3
+        dnf install -y curl wget tar lsof procps-ng openssl ca-certificates jq zip python3 iproute
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget tar lsof procps-ng openssl ca-certificates jq zip python3
+        yum install -y curl wget tar lsof procps-ng openssl ca-certificates jq zip python3 iproute
     fi
+}
+
+# 检查指定端口是否已被占用 (0 表示占用，1 表示空闲)
+is_port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln | grep -qE ":${port}\b" && return 0 || return 1
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tuln | grep -qE ":${port}\b" && return 0 || return 1
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:"${port}" -sTCP:LISTEN -P -n >/dev/null 2>&1 && return 0 || return 1
+    else
+        (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1 && return 0 || return 1
+    fi
+}
+
+# 自动生成一个未被占用、避开常见服务的高位端口 (10000 ~ 60000)
+get_random_high_port() {
+    local candidate_port
+    # 避开已知/高频代理/特定服务端口黑名单
+    local blacklist_regex="^(10080|10086|10808|10809|11211|20000|2053|2083|2087|2096|27017|33060|54321)$"
+
+    while true; do
+        if command -v shuf >/dev/null 2>&1; then
+            candidate_port=$(shuf -i 10000-60000 -n 1)
+        else
+            candidate_port=$(( RANDOM % 50001 + 10000 ))
+        fi
+
+        # 检查是否命中黑名单
+        if [[ "$candidate_port" =~ $blacklist_regex ]]; then
+            continue
+        fi
+
+        # 检查是否已被占用
+        if is_port_in_use "${candidate_port}"; then
+            continue
+        fi
+
+        echo "${candidate_port}"
+        return 0
+    done
 }
 
 get_public_ip() {
@@ -384,7 +428,7 @@ test_proxy() {
     echo -e "${SKYBLUE}[测试 1] 正在测试合法客户端证书 (mTLS) 连接...${PLAIN}"
 
     local res
-    res=$(curl -s4m 6 --resolve "${DOMAIN:-node7.mmtqtq.com}:${PORT}:127.0.0.1" \
+    res=$(curl -s4m 6 --resolve "${DOMAIN:-127.0.0.1}:${PORT}:127.0.0.1" \
         --proxy-cert "${CERTS_DIR}/client.crt" \
         --proxy-key "${CERTS_DIR}/client.key" \
         -x "https://${DOMAIN:-127.0.0.1}:${PORT}" https://api.ipify.org 2>/dev/null || echo "")
@@ -397,7 +441,7 @@ test_proxy() {
 
     echo -e "${SKYBLUE}[测试 2] 正在测试外部无证书非法探测防御 (预期: 握手直接被拒)...${PLAIN}"
     local probe_test
-    probe_test=$(curl -s4m 4 --resolve "${DOMAIN:-node7.mmtqtq.com}:${PORT}:127.0.0.1" \
+    probe_test=$(curl -s4m 4 --resolve "${DOMAIN:-127.0.0.1}:${PORT}:127.0.0.1" \
         -x "https://${DOMAIN:-127.0.0.1}:${PORT}" https://api.ipify.org 2>&1 || true)
     if [[ "$probe_test" == *"certificate required"* || "$probe_test" == *"handshake failure"* || "$probe_test" == *"alert"* || -z "$probe_test" ]]; then
         echo -e "${GREEN}[成功] 防探测测试通过！未携带证书的外部连接被 TLS 握手层静默丢弃/拒绝。${PLAIN}"
@@ -411,6 +455,9 @@ interactive_install() {
     echo -e "${SKYBLUE}====================================================${PLAIN}"
     echo -e "${SKYBLUE}      GOST v3 mTLS 双向认证代理一键部署向导         ${PLAIN}"
     echo -e "${SKYBLUE}====================================================${PLAIN}"
+
+    echo -e "${SKYBLUE}[1/5] 安装系统依赖组件...${PLAIN}"
+    install_dependencies
 
     detect_existing_certs
     detect_existing_domain
@@ -430,18 +477,36 @@ interactive_install() {
     read -r -p "请输入服务端连接域名或 IP [默认: ${default_domain}]: " input_domain
     local domain="${input_domain:-$default_domain}"
 
-    local default_port="8443"
-    read -r -p "请输入 GOST 代理监听端口 [默认: ${default_port}]: " input_port
-    local port="${input_port:-$default_port}"
+    # 动态获取一个未被占用的安全高位端口作为默认值
+    local default_port
+    default_port=$(get_random_high_port)
+    local port=""
+
+    while true; do
+        read -r -p "请输入 GOST 代理监听端口 [默认随机高位: ${default_port}]: " input_port
+        port="${input_port:-$default_port}"
+
+        # 校验是否为合法数字 (1-65535)
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+            echo -e "${RED}[错误]${PLAIN} 端口号无效，请输入 1-65535 之间的有效数字！"
+            continue
+        fi
+
+        # 占用冲突检查
+        if is_port_in_use "${port}"; then
+            echo -e "${RED}[冲突]${PLAIN} 检测到端口 ${port} 已被系统其他进程占用，请更换其他端口！"
+            default_port=$(get_random_high_port)
+        else
+            echo -e "${GREEN}[可用]${PLAIN} 端口 ${port} 验证通过（未被占用）。"
+            break
+        fi
+    done
 
     local default_pass="123456"
     read -r -p "请设置客户端证书 (.p12) 导入密码 [默认: ${default_pass}]: " input_pass
     local p12_pass="${input_pass:-$default_pass}"
 
     echo -e ""
-    echo -e "${SKYBLUE}[1/5] 安装系统依赖组件...${PLAIN}"
-    install_dependencies
-
     echo -e "${SKYBLUE}[2/5] 部署 GOST v3 核心...${PLAIN}"
     install_gost_bin
 
