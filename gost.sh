@@ -7,8 +7,9 @@
 # 2. 握手层拦截未授权请求，天然免疫 GFW 主动探测与端口扫描
 # 3. 自动生成 CA、服务端证书与客户端证书 (.p12 格式一键导入)
 # 4. 自动检测并分配可用高位端口 (10000-60000)，避开常用服务
-# 5. 内置临时安全下载服务 (3分钟自动销毁/按q退出)
-# 6. 支持在任意路径下直接运行，自动注册全局 gost 命令
+# 5. 内置临时安全 HTTPS 下载服务 (TLS 加密传输，3分钟自动销毁/按q退出)
+# 6. 运行状态自动感知 (未安装/运行中/已停止，安装向导防误覆写)
+# 7. 支持在任意路径下直接运行，自动注册全局 gost 命令
 # =========================================================
 
 set -e
@@ -59,6 +60,15 @@ install_dependencies() {
     fi
 }
 
+# 判断 GOST 是否已安装 (检查二进制与环境配置)
+is_installed() {
+    if [[ -f "${BIN_PATH}" && -f "${ENV_FILE}" && -f "${CONFIG_FILE}" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # 检查指定端口是否已被占用 (0 表示占用，1 表示空闲)
 is_port_in_use() {
     local port="$1"
@@ -76,7 +86,6 @@ is_port_in_use() {
 # 自动生成一个未被占用、避开常见服务的高位端口 (10000 ~ 60000)
 get_random_high_port() {
     local candidate_port
-    # 避开已知/高频代理/特定服务端口黑名单
     local blacklist_regex="^(10080|10086|10808|10809|11211|20000|2053|2083|2087|2096|27017|33060|54321)$"
 
     while true; do
@@ -86,12 +95,10 @@ get_random_high_port() {
             candidate_port=$(( RANDOM % 50001 + 10000 ))
         fi
 
-        # 检查是否命中黑名单
         if [[ "$candidate_port" =~ $blacklist_regex ]]; then
             continue
         fi
 
-        # 检查是否已被占用
         if is_port_in_use "${candidate_port}"; then
             continue
         fi
@@ -309,6 +316,7 @@ EOF
     sleep 1
 }
 
+# 开启基于 HTTPS (TLS) 的临时安全下载服务
 start_download_server() {
     if [[ ! -f "${CERTS_DIR}/client.p12" ]]; then
         echo -e "${RED}[错误]${PLAIN} 未找到证书文件，请先安装 GOST mTLS 服务！"
@@ -321,7 +329,16 @@ start_download_server() {
     local token
     token=$(openssl rand -hex 6)
     local dl_port
-    dl_port=$(shuf -i 20000-35000 -n 1)
+    dl_port=$(get_random_high_port)
+
+    # 确定用于 HTTPS 下载服务的证书与私钥 (优先使用已有配置的服务端证书)
+    local cert_for_dl="${SERVER_CERT}"
+    local key_for_dl="${SERVER_KEY}"
+
+    if [[ ! -f "${cert_for_dl}" || ! -f "${key_for_dl}" ]]; then
+        cert_for_dl="${CERTS_DIR}/server.crt"
+        key_for_dl="${CERTS_DIR}/server.key"
+    fi
 
     local dl_dir="/tmp/gost_download_${token}"
     mkdir -p "${dl_dir}/${token}"
@@ -329,31 +346,59 @@ start_download_server() {
     cp "${CERTS_DIR}/client-certs.zip" "${dl_dir}/${token}/client-certs.zip"
     cp "${CERTS_DIR}/ca.crt" "${dl_dir}/${token}/ca.crt"
 
-    python3 -m http.server "${dl_port}" --directory "${dl_dir}" >/dev/null 2>&1 &
+    # 生成临时 HTTPS Python 启动脚本，内置 TLS 加密支持
+    cat << 'EOF' > "${dl_dir}/https_server.py"
+import http.server
+import ssl
+import sys
+import os
+
+port = int(sys.argv[1])
+web_dir = sys.argv[2]
+cert_file = sys.argv[3]
+key_file = sys.argv[4]
+
+os.chdir(web_dir)
+handler = http.server.SimpleHTTPRequestHandler
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+
+httpd = http.server.HTTPServer(('0.0.0.0', port), handler)
+httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+
+try:
+    httpd.serve_forever()
+except Exception:
+    pass
+EOF
+
+    python3 "${dl_dir}/https_server.py" "${dl_port}" "${dl_dir}" "${cert_for_dl}" "${key_for_dl}" >/dev/null 2>&1 &
     local server_pid=$!
 
     clear
     echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e "${GREEN}        GOST mTLS 客户端证书临时下载服务 (已开启)    ${PLAIN}"
+    echo -e "${GREEN}      GOST mTLS 客户端证书临时下载服务 (HTTPS 已开启)${PLAIN}"
     echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e "  ${SKYBLUE}下载服务地址 (在浏览器直接打开即可下载):${PLAIN}"
+    echo -e "  ${SKYBLUE}安全下载链接 (已启用 TLS 全程加密):${PLAIN}"
     echo -e ""
     if [[ -n "${DOMAIN}" && "${DOMAIN}" != "${server_ip}" ]]; then
-        echo -e "  📦 ${GREEN}PKCS#12 证书 (域名推荐):${PLAIN}"
-        echo -e "     http://${DOMAIN}:${dl_port}/${token}/client.p12"
+        echo -e "  🔒 ${GREEN}PKCS#12 证书 (域名推荐):${PLAIN}"
+        echo -e "     https://${DOMAIN}:${dl_port}/${token}/client.p12"
         echo -e ""
-        echo -e "  📦 ${GREEN}完整证书 ZIP 压缩包 (域名):${PLAIN}"
-        echo -e "     http://${DOMAIN}:${dl_port}/${token}/client-certs.zip"
+        echo -e "  🔒 ${GREEN}完整证书 ZIP 压缩包 (域名):${PLAIN}"
+        echo -e "     https://${DOMAIN}:${dl_port}/${token}/client-certs.zip"
         echo -e ""
     fi
-    echo -e "  📦 ${GREEN}PKCS#12 证书 (IP 直连):${PLAIN}"
-    echo -e "     http://${server_ip}:${dl_port}/${token}/client.p12"
+    echo -e "  🔒 ${GREEN}PKCS#12 证书 (IP 直连):${PLAIN}"
+    echo -e "     https://${server_ip}:${dl_port}/${token}/client.p12"
     echo -e ""
-    echo -e "  📦 ${GREEN}完整证书 ZIP 压缩包 (IP 直连):${PLAIN}"
-    echo -e "     http://${server_ip}:${dl_port}/${token}/client-certs.zip"
+    echo -e "  🔒 ${GREEN}完整证书 ZIP 压缩包 (IP 直连):${PLAIN}"
+    echo -e "     https://${server_ip}:${dl_port}/${token}/client-certs.zip"
     echo -e ""
     echo -e "  🔑 ${SKYBLUE}证书导入密码:${PLAIN} ${P12_PASS:-123456}"
     echo -e "${GREEN}====================================================${PLAIN}"
+    echo -e "  ${YELLOW}注意: 若使用自签名证书，浏览器首次打开提示不受信任时点击继续即可${PLAIN}"
     echo -e "  ${YELLOW}提示: 服务将在 3 分钟后自动销毁关闭，也可按 [q] 键提前退出${PLAIN}"
     echo -e "${GREEN}====================================================${PLAIN}"
 
@@ -376,7 +421,7 @@ start_download_server() {
 
     kill "${server_pid}" >/dev/null 2>&1 || true
     rm -rf "${dl_dir}"
-    echo -e "${GREEN}[已安全关闭] 临时下载端口与临时文件已清理完成！${PLAIN}"
+    echo -e "${GREEN}[已安全关闭] 临时 HTTPS 下载端口与临时文件已清理完成！${PLAIN}"
     sleep 1
 }
 
@@ -455,6 +500,19 @@ interactive_install() {
     echo -e "${SKYBLUE}====================================================${PLAIN}"
     echo -e "${SKYBLUE}      GOST v3 mTLS 双向认证代理一键部署向导         ${PLAIN}"
     echo -e "${SKYBLUE}====================================================${PLAIN}"
+
+    # 检查是否已有配置历史
+    if is_installed; then
+        source "${ENV_FILE}" 2>/dev/null || true
+        echo -e "${YELLOW}[注意] 检测到系统已经安装过 GOST mTLS 服务！${PLAIN}"
+        echo -e "当前配置信息: 域名/IP: ${GREEN}${DOMAIN}${PLAIN} | 端口: ${GREEN}${PORT}${PLAIN}"
+        read -r -p "是否覆盖重新安装？[y/N]: " confirm_reinstall
+        if [[ "$confirm_reinstall" != "y" && "$confirm_reinstall" != "Y" ]]; then
+            echo -e "${SKYBLUE}[提示] 已取消重新安装。返回主菜单。${PLAIN}"
+            sleep 1
+            return 0
+        fi
+    fi
 
     echo -e "${SKYBLUE}[1/5] 安装系统依赖组件...${PLAIN}"
     install_dependencies
@@ -550,10 +608,12 @@ uninstall_gost() {
 }
 
 get_status() {
-    if systemctl is-active --quiet gost.service; then
+    if ! is_installed; then
+        echo -e "${YELLOW}○ 未安装${PLAIN}"
+    elif systemctl is-active --quiet gost.service; then
         echo -e "${GREEN}● 运行中${PLAIN}"
     else
-        echo -e "${RED}○ 未运行${PLAIN}"
+        echo -e "${RED}○ 已停止${PLAIN}"
     fi
 }
 
@@ -564,7 +624,7 @@ main_menu() {
         echo -e "${GREEN}     GOST v3 mTLS 双向认证代理一键管理 (免密版)     ${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e " ${GREEN}1)${PLAIN} 安装 / 重新配置 GOST (mTLS)"
-        echo -e " ${GREEN}2)${PLAIN} 开启客户端证书下载链接 (在浏览器直接下载 .p12)"
+        echo -e " ${GREEN}2)${PLAIN} 开启客户端证书安全下载链接 (HTTPS)"
         echo -e " ${GREEN}3)${PLAIN} 重新生成客户端证书"
         echo -e " ${GREEN}4)${PLAIN} 启动 GOST 服务"
         echo -e " ${GREEN}5)${PLAIN} 停止 GOST 服务"
@@ -583,6 +643,11 @@ main_menu() {
             1) interactive_install; break ;;
             2) start_download_server; break ;;
             3)
+                if ! is_installed; then
+                    echo -e "${RED}[错误] GOST 尚未安装，无法生成证书！${PLAIN}"
+                    sleep 2
+                    continue
+                fi
                 source "${ENV_FILE}" 2>/dev/null || true
                 generate_mtls_certificates "${DOMAIN:-example.com}" "${P12_PASS:-123456}"
                 systemctl restart gost.service
