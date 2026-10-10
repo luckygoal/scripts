@@ -17,3 +17,9 @@ wget -O /tmp/xray-ipv4.sh \
   https://raw.githubusercontent.com/luckygoal/scripts/main/xray-ipv4.sh \
 && chmod 700 /tmp/xray-ipv4.sh \
 && sudo /tmp/xray-ipv4.sh
+
+
+curl -fL "https://raw.githubusercontent.com/luckygoal/scripts/main/brutal.sh" \
+  -o /root/brutal.sh
+chmod 700 /root/brutal.sh
+/root/brutal.sh
