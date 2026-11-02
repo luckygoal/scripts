@@ -271,4 +271,57 @@ echo "0 2 * * 0 tar czf /root/easynode-backup/easynode-\$(date +\\\\%F).tar.gz $
 
 ########################################
 # 首次同步验证
-################
+########################################
+
+/root/easynode_sync.sh
+
+########################################
+# 输出结果
+########################################
+
+echo
+echo "======================================"
+echo " EasyNode HA 部署完成"
+echo "======================================"
+echo
+
+echo "主节点 | awk '{print $1}'
+
+echo
+echo "备用节点:"
+echo "$BACKUP_IP"
+
+echo
+echo "时区:"
+echo "$TIMEZONE"
+
+echo
+echo "同步时间:"
+echo "$SYNC_TIME"
+
+echo
+echo "同步密钥:"
+echo "$SYNC_KEY"
+
+echo
+echo "同步日志:"
+echo "$SYNC_LOG"
+
+echo
+echo "SSH主机数量:"
+echo "$HOST_COUNT"
+
+echo
+echo "脚本数量:"
+echo "$SCRIPT_COUNT"
+
+echo
+echo "SSH密钥数量:"
+echo "$KEY_COUNT"
+
+echo
+echo "当前Crontab:"
+crontab -l
+
+echo
+msg "部署成功"
