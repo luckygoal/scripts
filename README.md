@@ -26,5 +26,5 @@ wget -N --no-check-certificate "https://raw.githubusercontent.com/luckygoal/scri
 
 
 wget https://raw.githubusercontent.com/luckygoal/scripts/mail/easynode-ha-v2.sh
-chmod +x easynode-ha-v2.sh
-bash easynode-ha-v2.sh
+&& chmod +x easynode-ha-v2.sh
+&& bash easynode-ha-v2.sh
