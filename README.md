@@ -23,3 +23,8 @@ wget -N --no-check-certificate "https://raw.githubusercontent.com/luckygoal/scri
   -o /root/brutal.sh
 && chmod 700 /root/brutal.sh
 && /root/brutal.sh
+
+
+wget https://raw.githubusercontent.com/luckygoal/scripts/mail/easynode-ha-v2.sh
+chmod +x easynode-ha-v2.sh
+bash easynode-ha-v2.sh
